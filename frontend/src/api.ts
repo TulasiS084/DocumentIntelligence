@@ -1,6 +1,6 @@
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
-export type PipelineStatus = "cloning" | "scanning" | "ready" | "failed";
+export type PipelineStatus = "cloning" | "scanning" | "parsing" | "graphing" | "ready" | "failed";
 
 export type SkipReason = "too_large" | "binary" | "limit_reached" | "ignored";
 
@@ -14,7 +14,7 @@ export interface TreeNode {
   loc: number | null;
   skipped: boolean;
   skip_reason: SkipReason | null;
-  summary: null;
+  summary: string | null;
   children: TreeNode[] | null;
 }
 
@@ -38,6 +38,103 @@ export interface StatusPayload {
 export interface TreeResponse {
   tree: TreeNode;
   stats: TreeStats;
+}
+
+// ---------------------------------------------------------------------------
+// Step 2 Graph & File interfaces
+// ---------------------------------------------------------------------------
+
+export type NodeRole = "entry" | "core" | "helper" | "test" | "other";
+export type EdgeKind = "import" | "call" | "data_read" | "config_ref" | "doc_link" | "test_of";
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  folder: string;
+  language: string | null;
+  loc: number;
+  kind: "code" | "notebook" | "doc" | "config" | "sql" | "data" | "test" | "other";
+  role: NodeRole;
+  in_degree: number;
+  out_degree: number;
+  summary: string;
+  external: string[];
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  kind: EdgeKind;
+  weight?: number;
+  count?: number;
+}
+
+export interface FolderNode {
+  id: string;
+  label: string;
+  files: string[];
+  role: NodeRole;
+  summary: string;
+  file_count: number;
+  loc: number;
+}
+
+export interface FolderEdge {
+  source: string;
+  target: string;
+  kind: EdgeKind;
+  count: number;
+}
+
+export interface FolderGraph {
+  nodes: FolderNode[];
+  edges: FolderEdge[];
+}
+
+export interface GraphOverview {
+  nodes: FolderNode[];
+  edges: FolderEdge[];
+  entry_points: string[];
+  reading_order: string[];
+}
+
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  entry_points: string[];
+}
+
+export interface NodeDetail {
+  id: string;
+  label: string;
+  path: string;
+  folder: string;
+  role: NodeRole;
+  kind: string;
+  language: string | null;
+  loc: number;
+  summary: string;
+  external: string[];
+  dependencies: string[];
+  dependents: string[];
+  symbols: Array<{
+    name: string;
+    kind: string;
+    start_line: number;
+    end_line: number;
+  }>;
+  transitive_dependents_count: number;
+}
+
+export interface ReadingOrderResponse {
+  reading_order: string[];
+}
+
+export interface FileContent {
+  path: string;
+  language: string | null;
+  loc: number | null;
+  content: string;
 }
 
 export const GITHUB_URL_RE =
@@ -120,4 +217,79 @@ export async function fetchTree(repoId: string): Promise<TreeResponse> {
     throw new Error(await parseError(response));
   }
   return (await response.json()) as TreeResponse;
+}
+
+export async function fetchGraphOverview(repoId: string, includeHidden = false): Promise<GraphOverview> {
+  const url = `${API_BASE}/api/repos/${repoId}/graph/overview?include_hidden=${includeHidden}`;
+  const response = await fetch(url);
+  if (response.status === 409) {
+    throw new Error("Repository is not ready yet");
+  }
+  if (response.status === 404) {
+    throw new Error("Unknown repository");
+  }
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as GraphOverview;
+}
+
+export async function fetchGraphFolder(repoId: string, folder?: string, kinds = "import"): Promise<GraphData> {
+  const params = new URLSearchParams();
+  if (folder !== undefined) {
+    params.set("folder", folder);
+  }
+  if (kinds) {
+    params.set("kinds", kinds);
+  }
+  const url = `${API_BASE}/api/repos/${repoId}/graph?${params.toString()}`;
+  const response = await fetch(url);
+  if (response.status === 409) {
+    throw new Error("Repository is not ready yet");
+  }
+  if (response.status === 404) {
+    throw new Error("Unknown repository");
+  }
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as GraphData;
+}
+
+export async function fetchGraphNode(repoId: string, nodeId: string): Promise<NodeDetail> {
+  const url = `${API_BASE}/api/repos/${repoId}/graph/node?id=${encodeURIComponent(nodeId)}`;
+  const response = await fetch(url);
+  if (response.status === 409) {
+    throw new Error("Repository is not ready yet");
+  }
+  if (response.status === 404) {
+    throw new Error("Unknown node or repository");
+  }
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as NodeDetail;
+}
+
+export async function fetchReadingOrder(repoId: string): Promise<ReadingOrderResponse> {
+  const response = await fetch(`${API_BASE}/api/repos/${repoId}/reading-order`);
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as ReadingOrderResponse;
+}
+
+export async function fetchFile(repoId: string, path: string): Promise<FileContent> {
+  const url = `${API_BASE}/api/repos/${repoId}/file?path=${encodeURIComponent(path)}`;
+  const response = await fetch(url);
+  if (response.status === 400) {
+    throw new Error("Invalid file path");
+  }
+  if (response.status === 404) {
+    throw new Error("File not found or was skipped");
+  }
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as FileContent;
 }

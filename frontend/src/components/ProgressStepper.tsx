@@ -6,8 +6,10 @@ interface ProgressStepperProps {
   error: string | null;
 }
 
+type StepId = "cloning" | "scanning" | "parsing" | "graphing" | "ready";
+
 interface StepConfig {
-  id: "cloning" | "scanning" | "ready";
+  id: StepId;
   label: string;
   description: string;
 }
@@ -24,45 +26,56 @@ const STEPS: StepConfig[] = [
     description: "Walking repository, detecting languages & counting LOC",
   },
   {
+    id: "parsing",
+    label: "Parsing",
+    description: "Extracting imports, symbols & references with tree-sitter",
+  },
+  {
+    id: "graphing",
+    label: "Graphing",
+    description: "Building file connection graph & folder aggregations",
+  },
+  {
     id: "ready",
     label: "Ready",
-    description: "File tree & metadata persisted to SQLite",
+    description: "Code, graph & metadata ready to inspect",
   },
 ];
 
+const STAGE_ORDER: StepId[] = ["cloning", "scanning", "parsing", "graphing", "ready"];
+
 export default function ProgressStepper({ status, error }: ProgressStepperProps) {
-  const [lastActiveStage, setLastActiveStage] = useState<"cloning" | "scanning">("cloning");
+  const [lastActiveStage, setLastActiveStage] = useState<StepId>("cloning");
 
   useEffect(() => {
-    if (status === "cloning" || status === "scanning") {
+    if (status && status !== "failed" && status !== "ready") {
       setLastActiveStage(status);
     }
   }, [status]);
 
-  function getStepState(stepId: "cloning" | "scanning" | "ready") {
+  function getStepState(stepId: StepId) {
     if (!status) return "pending";
 
+    const currentStageIndex = status === "failed" 
+      ? STAGE_ORDER.indexOf(lastActiveStage)
+      : STAGE_ORDER.indexOf(status);
+    
+    const thisStepIndex = STAGE_ORDER.indexOf(stepId);
+
     if (status === "failed") {
-      if (stepId === lastActiveStage) return "failed";
-      if (stepId === "cloning" && lastActiveStage === "scanning") return "done";
+      if (thisStepIndex === currentStageIndex) return "failed";
+      if (thisStepIndex < currentStageIndex) return "done";
       return "pending";
     }
 
     if (status === "ready") return "done";
 
-    if (status === "scanning") {
-      if (stepId === "cloning") return "done";
-      if (stepId === "scanning") return "active";
-      return "pending";
-    }
-
-    if (status === "cloning") {
-      if (stepId === "cloning") return "active";
-      return "pending";
-    }
-
+    if (thisStepIndex < currentStageIndex) return "done";
+    if (thisStepIndex === currentStageIndex) return "active";
     return "pending";
   }
+
+  const isWorking = status === "cloning" || status === "scanning" || status === "parsing" || status === "graphing";
 
   return (
     <div
@@ -83,7 +96,7 @@ export default function ProgressStepper({ status, error }: ProgressStepperProps)
                   : "bg-indigo-50 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300"
             }`}
           >
-            {status === "cloning" || status === "scanning" ? (
+            {isWorking ? (
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-indigo-500" />
             ) : null}
             Status: {status}

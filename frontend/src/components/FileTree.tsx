@@ -6,6 +6,8 @@ type FileKind = "code" | "notebook" | "doc" | "config" | "data" | "other";
 interface FileTreeProps {
   tree: TreeNode;
   stats: TreeStats;
+  onSelectFile?: (path: string) => void;
+  selectedPath?: string | null;
 }
 
 const KIND_COLORS: Record<FileKind, { text: string; badge: string; bg: string }> = {
@@ -158,9 +160,11 @@ interface TreeItemProps {
   node: TreeNode;
   depth: number;
   forceOpen?: boolean;
+  onSelectFile?: (path: string) => void;
+  selectedPath?: string | null;
 }
 
-function TreeItem({ node, depth, forceOpen }: TreeItemProps) {
+function TreeItem({ node, depth, forceOpen, onSelectFile, selectedPath }: TreeItemProps) {
   const [open, setOpen] = useState(depth < 1);
 
   useEffect(() => {
@@ -173,6 +177,7 @@ function TreeItem({ node, depth, forceOpen }: TreeItemProps) {
   const color = KIND_COLORS[kind];
   const title = skipLabel(node.skip_reason);
   const isSkipped = node.skipped;
+  const isSelected = selectedPath === node.path;
 
   if (node.type === "dir") {
     return (
@@ -227,7 +232,14 @@ function TreeItem({ node, depth, forceOpen }: TreeItemProps) {
         {open && node.children && node.children.length > 0 && (
           <ul className="relative">
             {node.children.map((child) => (
-              <TreeItem key={child.path} node={child} depth={depth + 1} forceOpen={forceOpen} />
+              <TreeItem
+                key={child.path}
+                node={child}
+                depth={depth + 1}
+                forceOpen={forceOpen}
+                onSelectFile={onSelectFile}
+                selectedPath={selectedPath}
+              />
             ))}
           </ul>
         )}
@@ -238,8 +250,15 @@ function TreeItem({ node, depth, forceOpen }: TreeItemProps) {
   return (
     <li
       title={title || undefined}
-      className={`group flex items-center justify-between rounded-lg px-2 py-1 text-sm transition ${color.bg} ${
-        isSkipped ? "opacity-50 hover:opacity-80" : ""
+      onClick={() => {
+        if (!isSkipped && onSelectFile) {
+          onSelectFile(node.path);
+        }
+      }}
+      className={`group flex items-center justify-between rounded-lg px-2 py-1 text-sm transition cursor-pointer ${color.bg} ${
+        isSelected ? "ring-2 ring-indigo-500 bg-indigo-50/80 dark:bg-indigo-950/60" : ""
+      } ${
+        isSkipped ? "opacity-50 hover:opacity-80 cursor-not-allowed" : ""
       }`}
       style={{ paddingLeft: `${Math.max(26, depth * 18 + 26)}px` }}
     >
@@ -273,7 +292,7 @@ function TreeItem({ node, depth, forceOpen }: TreeItemProps) {
   );
 }
 
-export default function FileTree({ tree, stats }: FileTreeProps) {
+export default function FileTree({ tree, stats, onSelectFile, selectedPath }: FileTreeProps) {
   const [query, setQuery] = useState("");
   const [allExpanded, setAllExpanded] = useState<boolean | undefined>(undefined);
 
@@ -436,6 +455,8 @@ export default function FileTree({ tree, stats }: FileTreeProps) {
                 node={child}
                 depth={0}
                 forceOpen={normalized ? true : allExpanded}
+                onSelectFile={onSelectFile}
+                selectedPath={selectedPath}
               />
             ))}
           </ul>

@@ -1,1 +1,1 @@
-"""File-connection graph (populated in a later step)."""
+"""Graph construction: dependency edges, role detection, and folder aggregation."""

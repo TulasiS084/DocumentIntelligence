@@ -7,13 +7,14 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import get_settings
-from app.db import get_session, init_engine
+from app.db import get_repo_file, get_session, init_engine
 from app.ingest.cloner import InvalidUrlError, validate_github_url
 from app.ingest.pipeline import run_pipeline
 from app.models import AnalyzeRequest, AnalyzeResponse, HealthResponse, Repo
@@ -139,6 +140,202 @@ def repo_tree(repo_id: str) -> dict:
         return {
             "tree": json.loads(repo.tree_json),
             "stats": json.loads(repo.stats_json or "{}"),
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/repos/{repo_id}/graph/overview")
+def repo_graph_overview(repo_id: str, include_hidden: bool = False) -> dict:
+    """Return simplified folder-level graph with merged edges and counts."""
+    session = get_session()
+    try:
+        repo = session.get(Repo, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Unknown repository")
+        if repo.status != "ready" or not repo.graph_json:
+            raise HTTPException(status_code=409, detail="Repository is not ready yet")
+        graph_data = json.loads(repo.graph_json)
+        folder_graph = graph_data.get("folder_graph", {})
+        folder_nodes = folder_graph.get("nodes", [])
+        folder_edges = folder_graph.get("edges", [])
+
+        if not include_hidden:
+            hidden_names = {"tests", "__tests__", "test", "docs", "doc", ".github", "config"}
+            visible_nodes = []
+            for fn in folder_nodes:
+                name_lower = fn.get("label", "").lower()
+                role = fn.get("role", "")
+                if role in ("test", "doc", "config") or name_lower in hidden_names:
+                    continue
+                visible_nodes.append(fn)
+
+            visible_ids = {fn["id"] for fn in visible_nodes}
+            visible_edges = [
+                fe for fe in folder_edges
+                if fe.get("source") in visible_ids and fe.get("target") in visible_ids
+            ]
+            folder_nodes = visible_nodes
+            folder_edges = visible_edges
+
+        entry_points = graph_data.get("entry_points", [])
+
+        return {
+            "nodes": folder_nodes,
+            "edges": folder_edges,
+            "entry_points": entry_points,
+            "reading_order": graph_data.get("reading_order", []),
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/repos/{repo_id}/graph")
+def repo_graph_filtered(
+    repo_id: str,
+    folder: Optional[str] = None,
+    kinds: str = "import",
+) -> dict:
+    """Return file-level nodes and edges filtered by folder and edge kinds."""
+    session = get_session()
+    try:
+        repo = session.get(Repo, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Unknown repository")
+        if repo.status != "ready" or not repo.graph_json:
+            raise HTTPException(status_code=409, detail="Repository is not ready yet")
+        graph_data = json.loads(repo.graph_json)
+        all_nodes = graph_data.get("nodes", [])
+        all_edges = graph_data.get("edges", [])
+
+        if folder is not None:
+            target_folder = folder.strip()
+            filtered_nodes = [n for n in all_nodes if n.get("folder") == target_folder]
+        else:
+            filtered_nodes = all_nodes
+
+        node_ids = {n["id"] for n in filtered_nodes}
+        allowed_kinds = {k.strip() for k in kinds.split(",") if k.strip()}
+
+        filtered_edges = [
+            e for e in all_edges
+            if e.get("kind") in allowed_kinds
+            and (e.get("source") in node_ids or e.get("target") in node_ids)
+        ]
+
+        return {
+            "nodes": filtered_nodes,
+            "edges": filtered_edges,
+            "entry_points": graph_data.get("entry_points", []),
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/repos/{repo_id}/graph/node")
+def repo_graph_node(repo_id: str, id: str) -> dict:
+    """Return details for a single node: dependencies, dependents, symbols, summary."""
+    session = get_session()
+    try:
+        repo = session.get(Repo, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Unknown repository")
+        if repo.status != "ready" or not repo.graph_json:
+            raise HTTPException(status_code=409, detail="Repository is not ready yet")
+        graph_data = json.loads(repo.graph_json)
+        nodes = graph_data.get("nodes", [])
+        target_node = next((n for n in nodes if n.get("id") == id), None)
+        if target_node is None:
+            raise HTTPException(status_code=404, detail="Node not found in graph")
+
+        edges = graph_data.get("edges", [])
+        dependencies = sorted({e["target"] for e in edges if e.get("source") == id})
+        dependents = sorted({e["source"] for e in edges if e.get("target") == id})
+
+        rev_adj: dict[str, list[str]] = {}
+        for e in edges:
+            rev_adj.setdefault(e.get("target", ""), []).append(e.get("source", ""))
+
+        visited: set[str] = set()
+        queue = [id]
+        while queue:
+            curr = queue.pop(0)
+            for parent in rev_adj.get(curr, []):
+                if parent not in visited and parent != id:
+                    visited.add(parent)
+                    queue.append(parent)
+        transitive_count = len(visited)
+
+        symbols: list[dict] = []
+        if repo.parse_json:
+            parsed_list = json.loads(repo.parse_json)
+            target_pf = next((p for p in parsed_list if p.get("path") == id), None)
+            if target_pf and "symbols" in target_pf:
+                symbols = target_pf["symbols"]
+
+        return {
+            "id": target_node["id"],
+            "label": target_node.get("label", target_node["id"]),
+            "path": target_node["id"],
+            "folder": target_node.get("folder", "."),
+            "role": target_node.get("role", "other"),
+            "kind": target_node.get("kind", "code"),
+            "language": target_node.get("language"),
+            "loc": target_node.get("loc", 0),
+            "summary": target_node.get("summary", ""),
+            "external": target_node.get("external", []),
+            "dependencies": dependencies,
+            "dependents": dependents,
+            "symbols": symbols,
+            "transitive_dependents_count": transitive_count,
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/repos/{repo_id}/reading-order")
+def repo_reading_order(repo_id: str) -> dict:
+    """Return deterministic reading order for key repository files."""
+    session = get_session()
+    try:
+        repo = session.get(Repo, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Unknown repository")
+        if repo.status != "ready" or not repo.graph_json:
+            raise HTTPException(status_code=409, detail="Repository is not ready yet")
+        graph_data = json.loads(repo.graph_json)
+        return {
+            "reading_order": graph_data.get("reading_order", []),
+        }
+    finally:
+        session.close()
+
+
+@app.get("/api/repos/{repo_id}/file")
+def repo_file_content(repo_id: str, path: str) -> dict:
+    """Return stored content and metadata for a specific repository file."""
+    if not path or ".." in path or path.startswith("/") or path.startswith("\\") or ":" in path:
+        raise HTTPException(status_code=400, detail="Invalid file path")
+
+    clean_path = path.replace("\\", "/").lstrip("/")
+
+    session = get_session()
+    try:
+        repo = session.get(Repo, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Unknown repository")
+        if repo.status != "ready":
+            raise HTTPException(status_code=409, detail="Repository is not ready yet")
+
+        repo_file = get_repo_file(session, repo_id, clean_path)
+        if repo_file is None:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        return {
+            "path": repo_file.path,
+            "language": repo_file.language,
+            "loc": repo_file.loc,
+            "content": repo_file.content or "",
         }
     finally:
         session.close()
