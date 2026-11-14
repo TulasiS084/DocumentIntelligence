@@ -1,6 +1,14 @@
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 
-export type PipelineStatus = "cloning" | "scanning" | "parsing" | "graphing" | "ready" | "failed";
+export type PipelineStatus =
+  | "cloning"
+  | "scanning"
+  | "parsing"
+  | "graphing"
+  | "indexing"
+  | "summarizing"
+  | "ready"
+  | "failed";
 
 export type SkipReason = "too_large" | "binary" | "limit_reached" | "ignored";
 
@@ -292,4 +300,61 @@ export async function fetchFile(repoId: string, path: string): Promise<FileConte
     throw new Error(await parseError(response));
   }
   return (await response.json()) as FileContent;
+}
+
+export interface ProjectSummary {
+  repo_id: string;
+  overview: string | null;
+  stack: string[] | null;
+  how_to_run: string | null;
+  folder_guide: Record<string, string> | null;
+  key_files: string[] | null;
+  source: "llm" | "deterministic";
+}
+
+export interface SearchResultItem {
+  chunk_id: string;
+  path: string;
+  language: string | null;
+  kind: string;
+  symbol_name: string | null;
+  start_line: number;
+  end_line: number;
+  snippet: string;
+  score: number;
+  vector_rank: number | null;
+  bm25_rank: number | null;
+}
+
+export interface SearchResponse {
+  repo_id: string;
+  query: string;
+  mode: string;
+  confidence: number;
+  results: SearchResultItem[];
+}
+
+export async function fetchSummary(repoId: string): Promise<ProjectSummary> {
+  const response = await fetch(`${API_BASE}/api/repos/${repoId}/summary`);
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as ProjectSummary;
+}
+
+export async function searchRepo(
+  repoId: string,
+  query: string,
+  mode: "hybrid" | "vector" | "bm25" = "hybrid",
+  topK = 6
+): Promise<SearchResponse> {
+  const response = await fetch(`${API_BASE}/api/repos/${repoId}/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, mode, top_k: topK }),
+  });
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as SearchResponse;
 }

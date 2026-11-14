@@ -14,10 +14,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import get_settings
-from app.db import get_repo_file, get_session, init_engine
+from app.db import get_repo_file, get_repo_summary, get_session, init_engine, list_repo_summaries
 from app.ingest.cloner import InvalidUrlError, validate_github_url
 from app.ingest.pipeline import run_pipeline
-from app.models import AnalyzeRequest, AnalyzeResponse, HealthResponse, Repo
+from app.models import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    HealthResponse,
+    Repo,
+    SearchRequest,
+    SearchResponse,
+    SummaryResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +39,41 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     init_engine(settings.database_url)
+
+    # Log LLM configuration and key status safely without exposing keys
+    if settings.llm_provider == "gemini":
+        key_configured = "yes" if settings.is_gemini_key_configured else "no"
+        model_name = settings.gemini_model
+    elif settings.llm_provider == "groq":
+        key_configured = "yes" if settings.is_groq_key_configured else "no"
+        model_name = settings.groq_model
+    else:
+        key_configured = "n/a (local)"
+        model_name = settings.ollama_model
+
+    logger.info("LLM provider: %s, model: %s, key configured: %s", settings.llm_provider, model_name, key_configured)
+
+    # Log active vector store
+    try:
+        import chromadb
+        active_vs = f"ChromaDB (version {getattr(chromadb, '__version__', 'unknown')})"
+    except ImportError:
+        active_vs = "Built-in fallback (normalized vector store)"
+    logger.info("Active vector store: %s", active_vs)
+
+    # Pre-warm embedder in a daemon thread so analysis doesn't wait on cold-start
+    import threading
+
+    def _warmup_embedder() -> None:
+        try:
+            from app.rag.embedder import embed_query
+            embed_query("warmup")
+            logger.info("Embedding model pre-warmed and ready in memory")
+        except Exception as e:
+            logger.debug("Embedder warmup skipped: %s", e)
+
+    threading.Thread(target=_warmup_embedder, daemon=True).start()
+
     logger.info("Repo Analyzer API started")
     yield
 
@@ -127,6 +170,16 @@ async def repo_status(repo_id: str) -> StreamingResponse:
     )
 
 
+def _attach_summaries_to_tree(node: dict, summary_map: dict[str, str]) -> None:
+    """Recursively attach file summaries to file tree nodes."""
+    if node.get("type") == "file":
+        p = node.get("path")
+        if p and p in summary_map:
+            node["summary"] = summary_map[p]
+    for child in node.get("children") or []:
+        _attach_summaries_to_tree(child, summary_map)
+
+
 @app.get("/api/repos/{repo_id}/tree")
 def repo_tree(repo_id: str) -> dict:
     """Return the nested file tree and stats once analysis is ready."""
@@ -137,8 +190,13 @@ def repo_tree(repo_id: str) -> dict:
             raise HTTPException(status_code=404, detail="Unknown repository")
         if repo.status != "ready" or not repo.tree_json:
             raise HTTPException(status_code=409, detail="Repository is not ready yet")
+        tree = json.loads(repo.tree_json)
+        summaries = list_repo_summaries(session, repo_id, level="file")
+        if summaries:
+            s_map = {s.path: s.text for s in summaries if s.path}
+            _attach_summaries_to_tree(tree, s_map)
         return {
-            "tree": json.loads(repo.tree_json),
+            "tree": tree,
             "stats": json.loads(repo.stats_json or "{}"),
         }
     finally:
@@ -337,5 +395,83 @@ def repo_file_content(repo_id: str, path: str) -> dict:
             "loc": repo_file.loc,
             "content": repo_file.content or "",
         }
+    finally:
+        session.close()
+
+
+@app.get("/api/repos/{repo_id}/summary")
+def repo_summary(repo_id: str, level: str = "project", path: Optional[str] = None) -> dict:
+    """Return layered repository summary (project, folder, or file level)."""
+    session = get_session()
+    try:
+        repo = session.get(Repo, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Unknown repository")
+        if repo.status != "ready":
+            raise HTTPException(status_code=409, detail="Repository is not ready yet")
+
+        if level == "project":
+            summary = get_repo_summary(session, repo_id, "project", "")
+            if summary:
+                try:
+                    data = json.loads(summary.text)
+                    if isinstance(data, dict):
+                        data["repo_id"] = repo_id
+                        data["source"] = summary.source
+                        return data
+                except Exception:
+                    pass
+            return {
+                "repo_id": repo_id,
+                "overview": "Analysis ready.",
+                "stack": [],
+                "how_to_run": "See README.md for instructions.",
+                "folder_guide": {},
+                "key_files": [],
+                "source": "deterministic",
+            }
+
+        summary = get_repo_summary(session, repo_id, level, path or "")
+        if not summary:
+            raise HTTPException(status_code=404, detail=f"Summary for {level} not found")
+        return {
+            "repo_id": repo_id,
+            "level": level,
+            "path": summary.path,
+            "text": summary.text,
+            "source": summary.source,
+        }
+    finally:
+        session.close()
+
+
+@app.post("/api/repos/{repo_id}/search", response_model=SearchResponse)
+def repo_search(repo_id: str, body: SearchRequest) -> SearchResponse:
+    """Execute hybrid, vector, or BM25 search over code chunks."""
+    session = get_session()
+    try:
+        repo = session.get(Repo, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Unknown repository")
+        if repo.status != "ready":
+            raise HTTPException(status_code=409, detail="Repository is not ready yet")
+
+        from app.rag.retriever import retrieve
+
+        results, confidence = retrieve(
+            repo_id=repo_id,
+            query=body.query,
+            mode=body.mode,
+            top_k=body.top_k,
+            filters=body.filters,
+            commit_sha=repo.commit_sha,
+        )
+        return SearchResponse(
+            repo_id=repo_id,
+            query=body.query,
+            mode=body.mode,
+            confidence=confidence,
+            results=results,
+        )
     finally:
         session.close()

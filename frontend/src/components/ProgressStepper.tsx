@@ -6,7 +6,14 @@ interface ProgressStepperProps {
   error: string | null;
 }
 
-type StepId = "cloning" | "scanning" | "parsing" | "graphing" | "ready";
+type StepId =
+  | "cloning"
+  | "scanning"
+  | "parsing"
+  | "graphing"
+  | "indexing"
+  | "summarizing"
+  | "ready";
 
 interface StepConfig {
   id: StepId;
@@ -36,13 +43,31 @@ const STEPS: StepConfig[] = [
     description: "Building file connection graph & folder aggregations",
   },
   {
+    id: "indexing",
+    label: "Indexing",
+    description: "Splitting into semantic chunks & building BM25/vector indices",
+  },
+  {
+    id: "summarizing",
+    label: "Summarizing",
+    description: "Generating file, folder & architecture summaries",
+  },
+  {
     id: "ready",
     label: "Ready",
-    description: "Code, graph & metadata ready to inspect",
+    description: "Code, graph, summaries & search ready to inspect",
   },
 ];
 
-const STAGE_ORDER: StepId[] = ["cloning", "scanning", "parsing", "graphing", "ready"];
+const STAGE_ORDER: StepId[] = [
+  "cloning",
+  "scanning",
+  "parsing",
+  "graphing",
+  "indexing",
+  "summarizing",
+  "ready",
+];
 
 export default function ProgressStepper({ status, error }: ProgressStepperProps) {
   const [lastActiveStage, setLastActiveStage] = useState<StepId>("cloning");
@@ -75,7 +100,8 @@ export default function ProgressStepper({ status, error }: ProgressStepperProps)
     return "pending";
   }
 
-  const isWorking = status === "cloning" || status === "scanning" || status === "parsing" || status === "graphing";
+  const isWorking =
+    status !== null && status !== "ready" && status !== "failed";
 
   return (
     <div

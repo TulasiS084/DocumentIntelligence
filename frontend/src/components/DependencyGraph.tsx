@@ -26,6 +26,7 @@ import {
   type NodeDetail,
   type NodeRole,
 } from "../api";
+import RetrievalPlayground from "./RetrievalPlayground";
 
 interface DependencyGraphProps {
   repoId: string;
@@ -500,6 +501,10 @@ export default function DependencyGraph({
             <div className="rounded-lg bg-white dark:bg-slate-900 p-2.5 border border-slate-200 dark:border-slate-800">
               <span className="font-semibold text-slate-800 dark:text-slate-200">Expanded Folders:</span> {expandedFolders.size}
             </div>
+          </div>
+
+          <div className="pt-2">
+            <RetrievalPlayground repoId={repoId} onOpenFile={onOpenFile} />
           </div>
         </div>
       )}

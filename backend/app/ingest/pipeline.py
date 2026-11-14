@@ -7,12 +7,13 @@ import logging
 import os
 from dataclasses import asdict
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db import find_cached_ready, get_session, save_repo
+from app.db import find_cached_ready, get_session, save_repo, save_repo_chunks
 from app.ingest.cloner import CloneError, cleanup, clone_repo
 from app.ingest.scanner import scan_repository
-from app.models import Repo, RepoFile
+from app.models import Repo, RepoChunk, RepoFile, RepoSummary
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,13 @@ def _collect_files_from_tree(tree: dict, root_path: str) -> list[dict]:
     return results
 
 
-def _copy_repo_files(session: Session, source_id: str, target_id: str) -> None:
-    """Duplicate repo_files rows from a cached repo into the new repo."""
+def _copy_repo_artifacts(session: Session, source_id: str, target_id: str) -> None:
+    """Duplicate repo_files, chunks, and summaries from a cached repo into target repo."""
     from sqlalchemy import select
 
-    stmt = select(RepoFile).where(RepoFile.repo_id == source_id)
-    for src in session.scalars(stmt).all():
+    # Files
+    f_stmt = select(RepoFile).where(RepoFile.repo_id == source_id)
+    for src in session.scalars(f_stmt).all():
         session.add(
             RepoFile(
                 repo_id=target_id,
@@ -68,6 +70,38 @@ def _copy_repo_files(session: Session, source_id: str, target_id: str) -> None:
                 content=src.content,
             )
         )
+
+    # Chunks
+    c_stmt = select(RepoChunk).where(RepoChunk.repo_id == source_id)
+    for chunk in session.scalars(c_stmt).all():
+        session.add(
+            RepoChunk(
+                repo_id=target_id,
+                chunk_id=chunk.chunk_id,
+                path=chunk.path,
+                language=chunk.language,
+                kind=chunk.kind,
+                symbol_name=chunk.symbol_name,
+                start_line=chunk.start_line,
+                end_line=chunk.end_line,
+                text=chunk.text,
+                embed_text=chunk.embed_text,
+            )
+        )
+
+    # Summaries
+    s_stmt = select(RepoSummary).where(RepoSummary.repo_id == source_id)
+    for summ in session.scalars(s_stmt).all():
+        session.add(
+            RepoSummary(
+                repo_id=target_id,
+                level=summ.level,
+                path=summ.path,
+                text=summ.text,
+                source=summ.source,
+            )
+        )
+
     session.commit()
 
 
@@ -99,8 +133,9 @@ def run_pipeline(repo_id: str) -> None:
             repo.stats_json = cached.stats_json
             repo.graph_json = cached.graph_json
             repo.parse_json = cached.parse_json
+            repo.indexed = True
             save_repo(session, repo)
-            _copy_repo_files(session, cached.id, repo.id)
+            _copy_repo_artifacts(session, cached.id, repo.id)
             _set_status(session, repo, "ready")
             return
 
@@ -193,6 +228,63 @@ def run_pipeline(repo_id: str) -> None:
 
         repo.graph_json = json.dumps(graph_dict)
         save_repo(session, repo)
+
+        # ── indexing ────────────────────────────────────────────────
+        _set_status(session, repo, "indexing")
+        parse_by_path: dict[str, dict] = {}
+        try:
+            from app.rag.chunker import chunk_file
+            from app.rag.indexer import index_chunks
+
+            for pf in parsed_files:
+                p_path = getattr(pf, "path", None) or (pf.get("path") if isinstance(pf, dict) else None)
+                if p_path:
+                    parse_by_path[p_path] = asdict(pf) if hasattr(pf, "__dataclass_fields__") else pf
+
+            db_chunks: list[RepoChunk] = []
+            for rec in file_records:
+                chunks = chunk_file(
+                    rec["path"],
+                    rec["content"] or "",
+                    rec["language"],
+                    parse_info=parse_by_path.get(rec["path"]),
+                )
+                for c in chunks:
+                    db_chunks.append(
+                        RepoChunk(
+                            repo_id=repo.id,
+                            chunk_id=c.chunk_id,
+                            path=c.path,
+                            language=c.language,
+                            kind=c.kind,
+                            symbol_name=c.symbol_name,
+                            start_line=c.start_line,
+                            end_line=c.end_line,
+                            text=c.text,
+                            embed_text=c.embed_text,
+                        )
+                    )
+
+            save_repo_chunks(session, db_chunks)
+            index_chunks(repo.id, db_chunks, commit_sha=repo.commit_sha)
+            repo.indexed = True
+            from app.config import get_settings
+            repo.embedding_model = get_settings().embedding_model
+            save_repo(session, repo)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Indexing failed for %s", repo_id)
+
+        # ── summarizing ─────────────────────────────────────────────
+        _set_status(session, repo, "summarizing")
+        try:
+            from app.rag.summarizer import summarize_repository
+
+            stored_files = list(
+                session.scalars(select(RepoFile).where(RepoFile.repo_id == repo.id)).all()
+            )
+            summarize_repository(session, repo.id, stored_files, parse_by_path, stats)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Summarization failed for %s", repo_id)
 
         _set_status(session, repo, "ready")
     except CloneError as exc:

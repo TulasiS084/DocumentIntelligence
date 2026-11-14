@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import {
   createRepo,
+  fetchSummary,
   fetchTree,
   subscribeStatus,
   type PipelineStatus,
+  type ProjectSummary,
   type TreeNode,
   type TreeStats,
 } from "./api";
@@ -11,6 +13,7 @@ import CodeViewer from "./components/CodeViewer";
 import DependencyGraph from "./components/DependencyGraph";
 import FileTree from "./components/FileTree";
 import ProgressStepper from "./components/ProgressStepper";
+import SummaryPanel from "./components/SummaryPanel";
 import UrlForm from "./components/UrlForm";
 
 function getPreferredTheme(): "light" | "dark" {
@@ -35,6 +38,8 @@ export default function App() {
   const [tree, setTree] = useState<TreeNode | null>(null);
   const [stats, setStats] = useState<TreeStats | null>(null);
   const [loadingTree, setLoadingTree] = useState(false);
+  const [summary, setSummary] = useState<ProjectSummary | null>(null);
+  const [loadingSummary, setLoadingSummary] = useState(false);
 
   // Step 2 state: active tab ("diagram" | "tree"), selected file for CodeViewer, highlight lines
   const [activeTab, setActiveTab] = useState<"diagram" | "tree">("diagram");
@@ -53,6 +58,7 @@ export default function App() {
     setRepoId(null);
     setTree(null);
     setStats(null);
+    setSummary(null);
     setError(null);
     setStatus("cloning");
     setViewerFile(null);
@@ -82,17 +88,27 @@ export default function App() {
             isStopped = true;
             stop();
             setLoadingTree(true);
+            setLoadingSummary(true);
             try {
-              const result = await fetchTree(created.repo_id);
-              setTree(result.tree);
-              setStats(result.stats);
+              const [treeResult, summaryResult] = await Promise.allSettled([
+                fetchTree(created.repo_id),
+                fetchSummary(created.repo_id),
+              ]);
+              if (treeResult.status === "fulfilled") {
+                setTree(treeResult.value.tree);
+                setStats(treeResult.value.stats);
+              }
+              if (summaryResult.status === "fulfilled") {
+                setSummary(summaryResult.value);
+              }
               resolve();
             } catch (err) {
-              const fetchMsg = err instanceof Error ? err.message : "Failed to load file tree";
+              const fetchMsg = err instanceof Error ? err.message : "Failed to load repo data";
               setError(fetchMsg);
               reject(err);
             } finally {
               setLoadingTree(false);
+              setLoadingSummary(false);
             }
           } else if (payload.status === "failed") {
             isStopped = true;
@@ -112,6 +128,7 @@ export default function App() {
     setError(null);
     setTree(null);
     setStats(null);
+    setSummary(null);
     setActiveUrl(null);
     setRepoId(null);
     setViewerFile(null);
@@ -151,11 +168,11 @@ export default function App() {
                 RepoLens
               </h1>
               <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 dark:border-indigo-900/60 dark:bg-indigo-950/60 dark:text-indigo-300">
-                Step 2 Parser & Graph
+                Step 3 RAG & Semantic Summaries
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Code-based visual analyzer with tree-sitter parsers, dependency graph, and code viewer
+              Code-based visual analyzer with tree-sitter parsers, layered architecture summaries & hybrid RAG search
             </p>
           </div>
         </div>
@@ -224,6 +241,13 @@ export default function App() {
 
         {status === "ready" && repoId && tree && stats && (
           <div className="space-y-4">
+            {/* Architecture Summary */}
+            <SummaryPanel
+              summary={summary}
+              isLoading={loadingSummary}
+              onSelectFile={handleOpenFile}
+            />
+
             {/* Context bar with URL and View Tabs */}
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200/80 bg-white/60 px-4 py-2 text-xs backdrop-blur-sm dark:border-slate-800/80 dark:bg-slate-900/60">
               <div className="flex items-center gap-2 truncate">
