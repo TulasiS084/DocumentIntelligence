@@ -43,6 +43,73 @@ class Repo(Base):
     )
 
 
+# ── Step 4A Document Models ─────────────────────────────────────────────
+
+
+class Document(Base):
+    """Persisted metadata and status for an uploaded PDF document."""
+
+    __tablename__ = "documents"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="uploading")
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    warnings_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    stored_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    summary_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    outline_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    indexed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    embedding_model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class DocumentPage(Base):
+    """A single extracted page from a PDF document."""
+
+    __tablename__ = "document_pages"
+    __table_args__ = (UniqueConstraint("document_id", "page_number"),)
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    document_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False)  # 1-based
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    char_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class DocumentChunk(Base):
+    """A semantic chunk extracted from a PDF document."""
+
+    __tablename__ = "document_chunks"
+    __table_args__ = (UniqueConstraint("document_id", "chunk_id"),)
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    document_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    chunk_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    page_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    section: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="text")  # "text" | "table"
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    embed_text: Mapped[str] = mapped_column(Text, nullable=False)
+
+
 class RepoFile(Base):
     """A single file stored during repository analysis."""
 
@@ -188,3 +255,110 @@ class SummaryResponse(BaseModel):
     folder_guide: Optional[dict[str, str]] = None
     key_files: Optional[list[str]] = None
     source: str = "llm"
+
+
+# ── Step 4A Document API Schemas ─────────────────────────────────────────
+
+DocumentPipelineStatus = Literal[
+    "uploading", "extracting", "chunking", "indexing", "summarizing", "ready", "failed"
+]
+
+
+class DocumentStatusEvent(BaseModel):
+    """Payload streamed over SSE for document processing."""
+
+    status: DocumentPipelineStatus
+    error: Optional[str] = None
+
+
+class DocumentUploadItemResponse(BaseModel):
+    """Result of uploading a single document in a batch."""
+
+    document_id: str
+    filename: str
+    status: str
+    duplicate: bool = False
+    error: Optional[str] = None
+
+
+class DocumentListItemResponse(BaseModel):
+    """Compact summary of a document for lists."""
+
+    id: str
+    filename: str
+    size_bytes: int
+    page_count: int
+    status: str
+    error: Optional[str] = None
+    created_at: datetime
+
+
+class DocumentDetailResponse(BaseModel):
+    """Full detail view of an analyzed document."""
+
+    id: str
+    filename: str
+    sha256: str
+    size_bytes: int
+    page_count: int
+    status: str
+    error: Optional[str] = None
+    warnings: list[str] = Field(default_factory=list)
+    summary: Optional[dict[str, Any]] = None
+    outline: Optional[list[dict[str, Any]]] = None
+    indexed: bool = False
+    created_at: datetime
+
+
+class DocumentPageResponse(BaseModel):
+    """A single extracted page's text."""
+
+    page_number: int
+    text: str
+
+
+class DocumentSearchRequest(BaseModel):
+    """Query parameters for document search."""
+
+    query: str = Field(..., min_length=1, max_length=1000)
+    mode: Literal["hybrid", "vector", "bm25"] = "hybrid"
+    k: int = Field(6, ge=1, le=50)
+    filters: Optional[dict[str, Any]] = None
+
+
+class DocumentSearchResultItem(BaseModel):
+    """A matched document chunk result."""
+
+    chunk_id: str
+    document_id: str
+    filename: str
+    page_start: int
+    page_end: int
+    section: Optional[str] = None
+    kind: str
+    text: str
+    score: float
+    vector_rank: Optional[int] = None
+    bm25_rank: Optional[int] = None
+
+
+class DocumentSearchResponse(BaseModel):
+    """Document search results payload."""
+
+    document_id: str
+    query: str
+    mode: str
+    confidence: float
+    results: list[DocumentSearchResultItem]
+
+
+class RepoListItemResponse(BaseModel):
+    """Summary of an analyzed repository for the sources list."""
+
+    id: str
+    url: str
+    name: str
+    status: str
+    error: Optional[str] = None
+    commit_sha: Optional[str] = None
+    created_at: datetime

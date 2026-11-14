@@ -358,3 +358,165 @@ export async function searchRepo(
   }
   return (await response.json()) as SearchResponse;
 }
+
+// ---------------------------------------------------------------------------
+// Step 4A Documents & Sources Interfaces & Functions
+// ---------------------------------------------------------------------------
+
+export type DocPipelineStatus =
+  | "uploading"
+  | "extracting"
+  | "chunking"
+  | "indexing"
+  | "summarizing"
+  | "ready"
+  | "failed";
+
+export interface DocumentUploadItem {
+  document_id: string;
+  filename: string;
+  status: DocPipelineStatus;
+  duplicate: boolean;
+  error: string | null;
+}
+
+export interface DocumentListItem {
+  id: string;
+  filename: string;
+  size_bytes: number;
+  page_count: number;
+  status: DocPipelineStatus;
+  error: string | null;
+  created_at: string;
+}
+
+export interface RepoListItem {
+  id: string;
+  url: string;
+  name: string;
+  status: PipelineStatus;
+  error: string | null;
+  commit_sha: string | null;
+  created_at: string;
+}
+
+export interface DocumentOutlineEntry {
+  title: string;
+  level: number;
+  page?: number;
+}
+
+export interface DocumentSummary {
+  overview: string;
+  key_topics: string[];
+  suggested_questions: string[];
+  outline?: DocumentOutlineEntry[];
+  source: string;
+}
+
+export interface DocumentDetail {
+  id: string;
+  filename: string;
+  sha256: string;
+  size_bytes: number;
+  page_count: number;
+  status: DocPipelineStatus;
+  error: string | null;
+  warnings: string[];
+  summary: DocumentSummary | null;
+  outline: DocumentOutlineEntry[] | null;
+  indexed: boolean;
+  created_at: string;
+}
+
+export interface DocumentPageData {
+  page_number: number;
+  text: string;
+}
+
+export async function uploadDocuments(files: File[]): Promise<DocumentUploadItem[]> {
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append("files", file);
+  }
+  const response = await fetch(`${API_BASE}/api/documents`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as DocumentUploadItem[];
+}
+
+export async function fetchDocuments(): Promise<DocumentListItem[]> {
+  const response = await fetch(`${API_BASE}/api/documents`);
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as DocumentListItem[];
+}
+
+export async function fetchRepos(): Promise<RepoListItem[]> {
+  const response = await fetch(`${API_BASE}/api/repos`);
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as RepoListItem[];
+}
+
+export async function fetchDocumentDetail(docId: string): Promise<DocumentDetail> {
+  const response = await fetch(`${API_BASE}/api/documents/${docId}`);
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as DocumentDetail;
+}
+
+export async function fetchDocumentPage(docId: string, pageNum: number): Promise<DocumentPageData> {
+  const response = await fetch(`${API_BASE}/api/documents/${docId}/pages/${pageNum}`);
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as DocumentPageData;
+}
+
+export async function deleteDocument(docId: string): Promise<{ deleted: boolean; id: string }> {
+  const response = await fetch(`${API_BASE}/api/documents/${docId}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(await parseError(response));
+  }
+  return (await response.json()) as { deleted: boolean; id: string };
+}
+
+export function getDocumentFileUrl(docId: string): string {
+  return `${API_BASE}/api/documents/${docId}/file`;
+}
+
+export function subscribeDocumentStatus(
+  docId: string,
+  onEvent: (payload: { status: DocPipelineStatus; error: string | null }) => void,
+  onError?: (err: Event) => void
+): () => void {
+  const url = `${API_BASE}/api/documents/${docId}/status`;
+  const es = new EventSource(url);
+
+  es.addEventListener("status", (e: MessageEvent) => {
+    try {
+      const data = JSON.parse(e.data) as { status: DocPipelineStatus; error: string | null };
+      onEvent(data);
+    } catch {
+      // Ignore parse errors
+    }
+  });
+
+  es.onerror = (err) => {
+    if (onError) onError(err);
+  };
+
+  return () => {
+    es.close();
+  };
+}

@@ -7,21 +7,46 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import os
+from pathlib import Path
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.config import get_settings
-from app.db import get_repo_file, get_repo_summary, get_session, init_engine, list_repo_summaries
+from app.db import (
+    delete_document,
+    find_document_by_sha256,
+    get_document,
+    get_document_page,
+    get_repo_file,
+    get_repo_summary,
+    get_session,
+    init_engine,
+    list_documents,
+    list_repo_summaries,
+    list_repos,
+    save_document,
+)
 from app.ingest.cloner import InvalidUrlError, validate_github_url
+from app.ingest.documents.pipeline import run_document_pipeline
+from app.ingest.documents.validator import DocumentValidationError, stream_and_validate_upload
 from app.ingest.pipeline import run_pipeline
 from app.models import (
     AnalyzeRequest,
     AnalyzeResponse,
+    Document,
+    DocumentDetailResponse,
+    DocumentListItemResponse,
+    DocumentPageResponse,
+    DocumentSearchRequest,
+    DocumentSearchResponse,
+    DocumentUploadItemResponse,
     HealthResponse,
     Repo,
+    RepoListItemResponse,
     SearchRequest,
     SearchResponse,
     SummaryResponse,
@@ -468,6 +493,358 @@ def repo_search(repo_id: str, body: SearchRequest) -> SearchResponse:
         )
         return SearchResponse(
             repo_id=repo_id,
+            query=body.query,
+            mode=body.mode,
+            confidence=confidence,
+            results=results,
+        )
+    finally:
+        session.close()
+
+
+@app.get("/api/repos", response_model=list[RepoListItemResponse])
+def get_repos() -> list[RepoListItemResponse]:
+    """List all analyzed GitHub repositories."""
+    session = get_session()
+    try:
+        repos = list_repos(session)
+        out = []
+        for r in repos:
+            # Extract display name (e.g. "owner/repo" from GitHub URL)
+            url_parts = r.url.rstrip("/").split("/")
+            name = f"{url_parts[-2]}/{url_parts[-1]}" if len(url_parts) >= 2 else r.url
+            out.append(
+                RepoListItemResponse(
+                    id=r.id,
+                    url=r.url,
+                    name=name,
+                    status=r.status,
+                    error=r.error,
+                    commit_sha=r.commit_sha,
+                    created_at=r.created_at,
+                )
+            )
+        return out
+    finally:
+        session.close()
+
+
+# ── Step 4A Document Endpoints ───────────────────────────────────────────
+
+
+@app.post("/api/documents", response_model=list[DocumentUploadItemResponse])
+async def upload_documents(
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+) -> list[DocumentUploadItemResponse]:
+    """Upload up to MAX_FILES_PER_UPLOAD PDF documents.
+
+    Validates type, size, pages, and integrity.
+    One failing file does not reject the good files in the batch.
+    """
+    settings = get_settings()
+    if len(files) > settings.max_files_per_upload:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot upload more than {settings.max_files_per_upload} files at once.",
+        )
+
+    results: list[DocumentUploadItemResponse] = []
+    session = get_session()
+
+    try:
+        for file in files:
+            sanitized_name = file.filename or "document.pdf"
+            try:
+                (
+                    clean_name,
+                    stored_name,
+                    size_bytes,
+                    sha256_hex,
+                    page_count,
+                ) = await stream_and_validate_upload(
+                    upload_file=file,
+                    upload_dir=settings.upload_dir,
+                    max_bytes=settings.max_upload_bytes,
+                    max_pages=settings.max_pdf_pages,
+                )
+
+                # Check for cached duplicate by SHA-256
+                existing_doc = find_document_by_sha256(session, sha256_hex)
+                if existing_doc:
+                    # Clean up the newly written duplicate file
+                    dup_path = Path(settings.upload_dir) / stored_name
+                    if dup_path.exists():
+                        try:
+                            os.remove(dup_path)
+                        except OSError:
+                            pass
+
+                    results.append(
+                        DocumentUploadItemResponse(
+                            document_id=existing_doc.id,
+                            filename=existing_doc.filename,
+                            status=existing_doc.status,
+                            duplicate=True,
+                            error=None,
+                        )
+                    )
+                    continue
+
+                # Create document record
+                new_doc = Document(
+                    filename=clean_name,
+                    sha256=sha256_hex,
+                    size_bytes=size_bytes,
+                    page_count=page_count,
+                    status="uploading",
+                    stored_name=stored_name,
+                )
+                save_document(session, new_doc)
+
+                # Launch pipeline background task
+                background_tasks.add_task(run_document_pipeline, new_doc.id)
+
+                results.append(
+                    DocumentUploadItemResponse(
+                        document_id=new_doc.id,
+                        filename=clean_name,
+                        status="uploading",
+                        duplicate=False,
+                        error=None,
+                    )
+                )
+
+            except DocumentValidationError as val_err:
+                logger.warning("Upload validation failed for %s: %s", sanitized_name, val_err.message)
+                results.append(
+                    DocumentUploadItemResponse(
+                        document_id="",
+                        filename=sanitized_name,
+                        status="failed",
+                        duplicate=False,
+                        error=val_err.message,
+                    )
+                )
+            except Exception as exc:
+                logger.error("Unexpected error uploading %s: %s", sanitized_name, exc, exc_info=True)
+                results.append(
+                    DocumentUploadItemResponse(
+                        document_id="",
+                        filename=sanitized_name,
+                        status="failed",
+                        duplicate=False,
+                        error=str(exc),
+                    )
+                )
+
+        return results
+    finally:
+        session.close()
+
+
+@app.get("/api/documents", response_model=list[DocumentListItemResponse])
+def get_documents() -> list[DocumentListItemResponse]:
+    """List all uploaded documents."""
+    session = get_session()
+    try:
+        docs = list_documents(session)
+        return [
+            DocumentListItemResponse(
+                id=d.id,
+                filename=d.filename,
+                size_bytes=d.size_bytes,
+                page_count=d.page_count,
+                status=d.status,
+                error=d.error,
+                created_at=d.created_at,
+            )
+            for d in docs
+        ]
+    finally:
+        session.close()
+
+
+@app.get("/api/documents/{doc_id}/status")
+async def document_status(doc_id: str) -> StreamingResponse:
+    """Stream SSE status updates for a document until ready or failed."""
+    session = get_session()
+    try:
+        doc = get_document(session, doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Unknown document")
+    finally:
+        session.close()
+
+    async def event_stream() -> AsyncIterator[str]:
+        last: Optional[str] = None
+        while True:
+            loop_session = get_session()
+            try:
+                current = get_document(loop_session, doc_id)
+                if current is None:
+                    payload = {"status": "failed", "error": "Unknown document"}
+                    yield f"event: status\ndata: {json.dumps(payload)}\n\n"
+                    return
+                payload = {"status": current.status, "error": current.error}
+                encoded = json.dumps(payload)
+                if encoded != last:
+                    yield f"event: status\ndata: {encoded}\n\n"
+                    last = encoded
+                if current.status in {"ready", "failed"}:
+                    return
+            finally:
+                loop_session.close()
+            await asyncio.sleep(0.4)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/documents/{doc_id}", response_model=DocumentDetailResponse)
+def get_document_detail(doc_id: str) -> DocumentDetailResponse:
+    """Get full document metadata, warnings, outline, and summary."""
+    session = get_session()
+    try:
+        doc = get_document(session, doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Unknown document")
+
+        warnings = json.loads(doc.warnings_json) if doc.warnings_json else []
+        summary = json.loads(doc.summary_json) if doc.summary_json else None
+        outline = json.loads(doc.outline_json) if doc.outline_json else None
+
+        return DocumentDetailResponse(
+            id=doc.id,
+            filename=doc.filename,
+            sha256=doc.sha256,
+            size_bytes=doc.size_bytes,
+            page_count=doc.page_count,
+            status=doc.status,
+            error=doc.error,
+            warnings=warnings,
+            summary=summary,
+            outline=outline,
+            indexed=doc.indexed,
+            created_at=doc.created_at,
+        )
+    finally:
+        session.close()
+
+
+@app.get("/api/documents/{doc_id}/pages/{page_num}", response_model=DocumentPageResponse)
+def get_page(doc_id: str, page_num: int) -> DocumentPageResponse:
+    """Fetch text of a specific page (1-based)."""
+    session = get_session()
+    try:
+        doc = get_document(session, doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Unknown document")
+        if doc.status not in {"ready", "extracting", "chunking", "indexing", "summarizing", "failed"}:
+            raise HTTPException(status_code=409, detail="Document pages are not extracted yet")
+
+        page = get_document_page(session, doc_id, page_num)
+        if page is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Page {page_num} not found (document has {doc.page_count} pages)",
+            )
+
+        return DocumentPageResponse(page_number=page.page_number, text=page.text)
+    finally:
+        session.close()
+
+
+@app.get("/api/documents/{doc_id}/file")
+def get_document_file(doc_id: str) -> FileResponse:
+    """Serve the original uploaded PDF inline."""
+    settings = get_settings()
+    session = get_session()
+    try:
+        doc = get_document(session, doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Unknown document")
+
+        file_path = Path(settings.upload_dir) / doc.stored_name
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="Stored PDF file not found on disk")
+
+        return FileResponse(
+            path=str(file_path),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="{doc.filename}"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    finally:
+        session.close()
+
+
+@app.delete("/api/documents/{doc_id}")
+def delete_document_endpoint(doc_id: str) -> dict[str, Any]:
+    """Delete document file from disk, SQLite records, and search indices."""
+    settings = get_settings()
+    session = get_session()
+    try:
+        doc = get_document(session, doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Unknown document")
+
+        stored_file = Path(settings.upload_dir) / doc.stored_name
+        sha256 = doc.sha256
+
+        # 1. Clear search index (BM25, vector cache, ChromaDB)
+        from app.rag.doc_indexer import delete_document_index
+
+        delete_document_index(doc_id, sha256)
+
+        # 2. Delete database records
+        delete_document(session, doc_id)
+
+        # 3. Delete file on disk
+        if stored_file.exists():
+            try:
+                os.remove(stored_file)
+            except OSError as e:
+                logger.warning("Could not remove stored file %s: %s", stored_file, e)
+
+        return {"deleted": True, "id": doc_id}
+    finally:
+        session.close()
+
+
+@app.post("/api/documents/{doc_id}/search", response_model=DocumentSearchResponse)
+def search_document(doc_id: str, body: DocumentSearchRequest) -> DocumentSearchResponse:
+    """Execute hybrid, vector, or BM25 retrieval over a single document's chunks."""
+    session = get_session()
+    try:
+        doc = get_document(session, doc_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Unknown document")
+        if doc.status != "ready":
+            raise HTTPException(status_code=409, detail="Document is not ready yet")
+
+        from app.rag.retriever import retrieve_document
+
+        results, confidence = retrieve_document(
+            doc_id=doc_id,
+            query=body.query,
+            mode=body.mode,
+            top_k=body.k,
+            filters=body.filters,
+            sha256=doc.sha256,
+        )
+
+        return DocumentSearchResponse(
+            document_id=doc_id,
             query=body.query,
             mode=body.mode,
             confidence=confidence,

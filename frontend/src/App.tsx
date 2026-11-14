@@ -1,18 +1,31 @@
 import { useEffect, useState } from "react";
 import {
   createRepo,
+  deleteDocument,
+  fetchDocuments,
+  fetchRepos,
   fetchSummary,
   fetchTree,
+  subscribeDocumentStatus,
   subscribeStatus,
+  type DocPipelineStatus,
+  type DocumentListItem,
+  type DocumentUploadItem,
   type PipelineStatus,
   type ProjectSummary,
+  type RepoListItem,
   type TreeNode,
   type TreeStats,
 } from "./api";
 import CodeViewer from "./components/CodeViewer";
 import DependencyGraph from "./components/DependencyGraph";
+import DocumentProgressStepper from "./components/DocumentProgressStepper";
+import DocumentView from "./components/DocumentView";
 import FileTree from "./components/FileTree";
+import PdfUploadCard from "./components/PdfUploadCard";
 import ProgressStepper from "./components/ProgressStepper";
+import RetrievalPlayground from "./components/RetrievalPlayground";
+import SourcesList from "./components/SourcesList";
 import SummaryPanel from "./components/SummaryPanel";
 import UrlForm from "./components/UrlForm";
 
@@ -41,7 +54,14 @@ export default function App() {
   const [summary, setSummary] = useState<ProjectSummary | null>(null);
   const [loadingSummary, setLoadingSummary] = useState(false);
 
-  // Step 2 state: active tab ("diagram" | "tree"), selected file for CodeViewer, highlight lines
+  // Document states
+  const [repos, setRepos] = useState<RepoListItem[]>([]);
+  const [documents, setDocuments] = useState<DocumentListItem[]>([]);
+  const [activeDocId, setActiveDocId] = useState<string | null>(null);
+  const [docStatus, setDocStatus] = useState<DocPipelineStatus | null>(null);
+  const [docError, setDocError] = useState<string | null>(null);
+
+  // Tab & Viewer states for Repos
   const [activeTab, setActiveTab] = useState<"diagram" | "tree">("diagram");
   const [viewerFile, setViewerFile] = useState<string | null>(null);
   const [viewerHighlightLines, setViewerHighlightLines] = useState<[number, number] | undefined>(undefined);
@@ -53,7 +73,48 @@ export default function App() {
     window.localStorage.setItem("repo_analyzer_theme", theme);
   }, [theme]);
 
+  // Load existing repos and documents
+  async function refreshSources() {
+    try {
+      const [rList, dList] = await Promise.allSettled([fetchRepos(), fetchDocuments()]);
+      if (rList.status === "fulfilled") setRepos(rList.value);
+      if (dList.status === "fulfilled") setDocuments(dList.value);
+    } catch {
+      // Ignore background fetch failures
+    }
+  }
+
+  useEffect(() => {
+    refreshSources();
+  }, []);
+
+  async function loadRepoData(id: string) {
+    setLoadingTree(true);
+    setLoadingSummary(true);
+    try {
+      const [treeResult, summaryResult] = await Promise.allSettled([
+        fetchTree(id),
+        fetchSummary(id),
+      ]);
+      if (treeResult.status === "fulfilled") {
+        setTree(treeResult.value.tree);
+        setStats(treeResult.value.stats);
+      }
+      if (summaryResult.status === "fulfilled") {
+        setSummary(summaryResult.value);
+      }
+    } catch (err) {
+      const fetchMsg = err instanceof Error ? err.message : "Failed to load repo data";
+      setError(fetchMsg);
+    } finally {
+      setLoadingTree(false);
+      setLoadingSummary(false);
+    }
+  }
+
   async function handleSubmit(url: string) {
+    setActiveDocId(null);
+    setDocStatus(null);
     setActiveUrl(url);
     setRepoId(null);
     setTree(null);
@@ -75,7 +136,7 @@ export default function App() {
       throw err;
     }
 
-    await new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve) => {
       let isStopped = false;
       const stop = subscribeStatus(
         created.repo_id,
@@ -87,38 +148,19 @@ export default function App() {
           if (payload.status === "ready") {
             isStopped = true;
             stop();
-            setLoadingTree(true);
-            setLoadingSummary(true);
-            try {
-              const [treeResult, summaryResult] = await Promise.allSettled([
-                fetchTree(created.repo_id),
-                fetchSummary(created.repo_id),
-              ]);
-              if (treeResult.status === "fulfilled") {
-                setTree(treeResult.value.tree);
-                setStats(treeResult.value.stats);
-              }
-              if (summaryResult.status === "fulfilled") {
-                setSummary(summaryResult.value);
-              }
-              resolve();
-            } catch (err) {
-              const fetchMsg = err instanceof Error ? err.message : "Failed to load repo data";
-              setError(fetchMsg);
-              reject(err);
-            } finally {
-              setLoadingTree(false);
-              setLoadingSummary(false);
-            }
+            await loadRepoData(created.repo_id);
+            refreshSources();
+            resolve();
           } else if (payload.status === "failed") {
             isStopped = true;
             stop();
+            refreshSources();
             resolve();
           }
         },
         (_err) => {
-          // SSE connection dropped or error - EventSource retries automatically
-        },
+          // SSE retry handled automatically
+        }
       );
     });
   }
@@ -131,8 +173,92 @@ export default function App() {
     setSummary(null);
     setActiveUrl(null);
     setRepoId(null);
+    setActiveDocId(null);
+    setDocStatus(null);
+    setDocError(null);
     setViewerFile(null);
     setSelectedFilePath(null);
+    refreshSources();
+  }
+
+  function handleSelectRepo(r: RepoListItem) {
+    setActiveDocId(null);
+    setDocStatus(null);
+    setRepoId(r.id);
+    setActiveUrl(r.url);
+    setStatus(r.status);
+    setError(r.error);
+    setViewerFile(null);
+    setSelectedFilePath(null);
+
+    if (r.status === "ready") {
+      loadRepoData(r.id);
+    } else if (r.status !== "failed") {
+      const stop = subscribeStatus(r.id, (payload) => {
+        setStatus(payload.status);
+        setError(payload.error);
+        if (payload.status === "ready") {
+          stop();
+          loadRepoData(r.id);
+          refreshSources();
+        } else if (payload.status === "failed") {
+          stop();
+          refreshSources();
+        }
+      });
+    }
+  }
+
+  function handleSelectDoc(d: DocumentListItem) {
+    setRepoId(null);
+    setStatus(null);
+    setActiveDocId(d.id);
+    setDocStatus(d.status);
+    setDocError(d.error);
+
+    if (d.status !== "ready" && d.status !== "failed") {
+      const stop = subscribeDocumentStatus(d.id, (payload) => {
+        setDocStatus(payload.status);
+        setDocError(payload.error);
+        if (payload.status === "ready" || payload.status === "failed") {
+          stop();
+          refreshSources();
+        }
+      });
+    }
+  }
+
+  function handleUploadedDocs(uploaded: DocumentUploadItem[]) {
+    refreshSources();
+    const successful = uploaded.filter((u) => u.document_id);
+    if (successful.length > 0) {
+      const first = successful[0];
+      setRepoId(null);
+      setStatus(null);
+      setActiveDocId(first.document_id);
+      setDocStatus(first.status);
+      setDocError(first.error);
+
+      if (first.status !== "ready" && first.status !== "failed") {
+        const stop = subscribeDocumentStatus(first.document_id, (payload) => {
+          setDocStatus(payload.status);
+          setDocError(payload.error);
+          if (payload.status === "ready" || payload.status === "failed") {
+            stop();
+            refreshSources();
+          }
+        });
+      }
+    }
+  }
+
+  async function handleDeleteDocument(docId: string) {
+    await deleteDocument(docId);
+    if (activeDocId === docId) {
+      setActiveDocId(null);
+      setDocStatus(null);
+    }
+    refreshSources();
   }
 
   function handleOpenFile(path: string, line?: number) {
@@ -145,16 +271,27 @@ export default function App() {
     }
   }
 
-  const isBusy =
+  const isRepoBusy =
     status === "cloning" ||
     status === "scanning" ||
     status === "parsing" ||
     status === "graphing" ||
+    status === "indexing" ||
+    status === "summarizing" ||
     loadingTree;
+
+  const isDocBusy =
+    docStatus === "uploading" ||
+    docStatus === "extracting" ||
+    docStatus === "chunking" ||
+    docStatus === "indexing" ||
+    docStatus === "summarizing";
+
+  const showingDetails = (repoId && status === "ready") || (activeDocId && docStatus === "ready");
 
   return (
     <div className="mx-auto min-h-screen max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
-      {/* Top Navigation / Header */}
+      {/* Top Header */}
       <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
           <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-tr from-indigo-600 to-indigo-400 text-white shadow-md shadow-indigo-500/30">
@@ -168,17 +305,17 @@ export default function App() {
                 RepoLens
               </h1>
               <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 dark:border-indigo-900/60 dark:bg-indigo-950/60 dark:text-indigo-300">
-                Step 3 RAG & Semantic Summaries
+                Step 4A PDF Documents & Code Analysis
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Code-based visual analyzer with tree-sitter parsers, layered architecture summaries & hybrid RAG search
+              Visual codebase analyzer, tree-sitter parsers, PDF document indexer & hybrid semantic search
             </p>
           </div>
         </div>
 
         <div className="flex items-center gap-2">
-          {tree && !isBusy && (
+          {(showingDetails || isRepoBusy || isDocBusy) && (
             <button
               type="button"
               id="analyze-another-button"
@@ -186,9 +323,9 @@ export default function App() {
               className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
             >
               <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
               </svg>
-              <span>Analyze Another</span>
+              <span>Back to Sources</span>
             </button>
           )}
 
@@ -218,30 +355,16 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Content Sections */}
+      {/* Main Content Area */}
       <main className="space-y-6">
-        {/* Form */}
-        <UrlForm disabled={isBusy} onSubmitUrl={handleSubmit} />
-
-        {/* Stepper Progress */}
-        {status && <ProgressStepper status={status} error={error} />}
-
-        {/* Loading Overlay or Views */}
-        {loadingTree && (
-          <div className="flex items-center justify-center rounded-2xl border border-slate-200 bg-white/90 p-8 shadow-sm backdrop-blur-md dark:border-slate-800 dark:bg-slate-900/90">
-            <div className="flex items-center gap-3 text-sm text-slate-600 dark:text-slate-300">
-              <svg className="h-5 w-5 animate-spin text-indigo-600 dark:text-indigo-400" viewBox="0 0 24 24" fill="none">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-              <span>Fetching file tree from SQLite store…</span>
-            </div>
-          </div>
-        )}
-
-        {status === "ready" && repoId && tree && stats && (
+        {/* If viewing a selected Document */}
+        {activeDocId && docStatus === "ready" ? (
+          <DocumentView documentId={activeDocId} onClose={handleReset} />
+        ) : activeDocId && isDocBusy ? (
+          <DocumentProgressStepper status={docStatus} error={docError} />
+        ) : repoId && status === "ready" && tree && stats ? (
+          /* If viewing a selected Repo */
           <div className="space-y-4">
-            {/* Architecture Summary */}
             <SummaryPanel
               summary={summary}
               isLoading={loadingSummary}
@@ -262,123 +385,85 @@ export default function App() {
                 </a>
               </div>
 
-              {/* Navigation Tabs */}
-              <div className="flex items-center gap-1 rounded-lg bg-slate-100 p-1 dark:bg-slate-800">
-                <button
-                  type="button"
-                  id="tab-diagram-button"
-                  onClick={() => setActiveTab("diagram")}
-                  className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-semibold transition ${
-                    activeTab === "diagram"
-                      ? "bg-white text-indigo-600 shadow-sm dark:bg-slate-900 dark:text-indigo-400"
-                      : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
-                  }`}
-                >
-                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
-                  </svg>
-                  <span>Diagram</span>
-                </button>
-
-                <button
-                  type="button"
-                  id="tab-tree-button"
-                  onClick={() => setActiveTab("tree")}
-                  className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1 text-xs font-semibold transition ${
-                    activeTab === "tree"
-                      ? "bg-white text-indigo-600 shadow-sm dark:bg-slate-900 dark:text-indigo-400"
-                      : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
-                  }`}
-                >
-                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                  </svg>
-                  <span>File Tree</span>
-                </button>
+              <div className="flex items-center gap-2">
+                <div className="flex rounded-lg bg-slate-100 p-0.5 dark:bg-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab("diagram")}
+                    className={`rounded-md px-3 py-1 font-medium transition ${
+                      activeTab === "diagram"
+                        ? "bg-white text-indigo-700 shadow-sm dark:bg-slate-700 dark:text-white"
+                        : "text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
+                    }`}
+                  >
+                    Interactive Diagram
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab("tree")}
+                    className={`rounded-md px-3 py-1 font-medium transition ${
+                      activeTab === "tree"
+                        ? "bg-white text-indigo-700 shadow-sm dark:bg-slate-700 dark:text-white"
+                        : "text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
+                    }`}
+                  >
+                    File Tree
+                  </button>
+                </div>
               </div>
             </div>
 
-            {/* Main View Area */}
-            <div className="relative">
-              {activeTab === "diagram" ? (
-                <DependencyGraph
-                  repoId={repoId}
-                  onOpenFile={handleOpenFile}
-                  selectedFilePath={selectedFilePath}
-                />
-              ) : (
-                <FileTree
-                  tree={tree}
-                  stats={stats}
-                  onSelectFile={handleOpenFile}
-                  selectedPath={selectedFilePath}
-                />
-              )}
+            {/* RAG Retrieval Playground */}
+            <RetrievalPlayground repoId={repoId} onOpenFile={handleOpenFile} />
 
-              {/* Code Viewer Slide-in Panel */}
-              {viewerFile && (
-                <div className="fixed inset-y-0 right-0 w-full sm:w-[600px] lg:w-[680px] z-50 shadow-2xl transition-transform duration-300">
-                  <CodeViewer
-                    repoId={repoId}
-                    filePath={viewerFile}
-                    highlightLines={viewerHighlightLines}
-                    onClose={() => setViewerFile(null)}
-                  />
-                </div>
-              )}
+            {/* View Tabs */}
+            {activeTab === "diagram" ? (
+              <DependencyGraph
+                repoId={repoId}
+                onOpenFile={handleOpenFile}
+                selectedFilePath={selectedFilePath}
+              />
+            ) : (
+              <FileTree
+                tree={tree}
+                stats={stats}
+                onSelectFile={(path) => handleOpenFile(path)}
+                selectedPath={selectedFilePath}
+              />
+            )}
+          </div>
+        ) : (
+          /* Home Screen: Two cards side by side + Sources List */
+          <div className="space-y-8">
+            <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+              <UrlForm disabled={isRepoBusy || isDocBusy} onSubmitUrl={handleSubmit} />
+              <PdfUploadCard disabled={isRepoBusy || isDocBusy} onUploaded={handleUploadedDocs} />
             </div>
+
+            {status && isRepoBusy && <ProgressStepper status={status} error={error} />}
+
+            <SourcesList
+              repos={repos}
+              documents={documents}
+              selectedRepoId={repoId}
+              selectedDocId={activeDocId}
+              onSelectRepo={handleSelectRepo}
+              onSelectDoc={handleSelectDoc}
+              onDeleteDoc={handleDeleteDocument}
+            />
           </div>
         )}
 
-        {/* Initial Empty State */}
-        {!status && !tree && (
-          <div className="rounded-2xl border border-dashed border-slate-300 bg-white/40 p-8 text-center backdrop-blur-sm dark:border-slate-800 dark:bg-slate-900/30">
-            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-100 text-slate-400 dark:bg-slate-800 dark:text-slate-500">
-              <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-              </svg>
-            </div>
-            <h3 className="mt-4 text-sm font-semibold text-slate-800 dark:text-slate-200">
-              No Repository Loaded
-            </h3>
-            <p className="mx-auto mt-1 max-w-md text-xs text-slate-500 dark:text-slate-400">
-              Submit a public GitHub URL above or click one of the sample repositories to inspect its architecture.
-            </p>
-
-            <div className="mx-auto mt-6 grid max-w-2xl grid-cols-1 gap-3 sm:grid-cols-4 text-left">
-              <div className="rounded-xl border border-slate-200/80 bg-white/60 p-3.5 text-xs dark:border-slate-800 dark:bg-slate-900/60">
-                <div className="font-semibold text-slate-900 dark:text-slate-100">🔒 Safe Sandbox</div>
-                <div className="mt-1 text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Shallow depth=1 clone. Zero execution or installs.
-                </div>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-white/60 p-3.5 text-xs dark:border-slate-800 dark:bg-slate-900/60">
-                <div className="font-semibold text-slate-900 dark:text-slate-100">🌳 Tree-sitter AST</div>
-                <div className="mt-1 text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Extracts functions, classes, imports, and calls.
-                </div>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-white/60 p-3.5 text-xs dark:border-slate-800 dark:bg-slate-900/60">
-                <div className="font-semibold text-slate-900 dark:text-slate-100">📊 Visual Diagram</div>
-                <div className="mt-1 text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Interactive layered dependency graph with expand in place.
-                </div>
-              </div>
-              <div className="rounded-xl border border-slate-200/80 bg-white/60 p-3.5 text-xs dark:border-slate-800 dark:bg-slate-900/60">
-                <div className="font-semibold text-slate-900 dark:text-slate-100">💻 Code Viewer</div>
-                <div className="mt-1 text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Syntax-highlighted code with line numbers and jump-to.
-                </div>
-              </div>
-            </div>
-          </div>
+        {/* CodeViewer Drawer */}
+        {viewerFile && repoId && (
+          <CodeViewer
+            repoId={repoId}
+            filePath={viewerFile}
+            highlightLines={viewerHighlightLines}
+            onClose={() => setViewerFile(null)}
+          />
         )}
       </main>
-
-      {/* Footer */}
-      <footer className="mt-12 border-t border-slate-200/80 pt-6 text-center text-xs text-slate-400 dark:border-slate-800/80 dark:text-slate-500">
-        <p>RepoLens • Code-Based Visual Analyzer for GitHub Repositories • Step 2</p>
-      </footer>
     </div>
   );
 }

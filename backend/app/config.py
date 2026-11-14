@@ -57,8 +57,15 @@ class Settings(BaseSettings):
 
     min_confidence: float = Field(default=0.3, ge=0.0, le=1.0)
 
+    # ── Step 4A Documents & Uploads ─────────────────────────────────────
+    upload_dir: str = Field(default="./uploads")
+    max_upload_bytes: int = Field(default=20 * 1024 * 1024, ge=1)
+    max_files_per_upload: int = Field(default=5, ge=1)
+    max_pdf_pages: int = Field(default=300, ge=1)
+    max_total_upload_bytes: int = Field(default=500 * 1024 * 1024, ge=1)
+
     def model_post_init(self, __context: Any) -> None:
-        """Resolve relative database and chroma paths against the backend folder."""
+        """Resolve relative database, chroma, and upload paths against the backend folder."""
         # 1. Resolve relative SQLite URL against BACKEND_DIR
         if self.database_url.startswith("sqlite:///./"):
             rel_file = self.database_url.removeprefix("sqlite:///./")
@@ -75,6 +82,11 @@ class Settings(BaseSettings):
         cp = Path(self.chroma_path)
         if not cp.is_absolute():
             self.chroma_path = str((BACKEND_DIR / cp).resolve())
+
+        # 3. Resolve relative upload_dir against BACKEND_DIR
+        up = Path(self.upload_dir)
+        if not up.is_absolute():
+            self.upload_dir = str((BACKEND_DIR / up).resolve())
 
     @property
     def cors_origins(self) -> list[str]:

@@ -11,7 +11,16 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_settings
-from app.models import Base, Repo, RepoChunk, RepoFile, RepoSummary
+from app.models import (
+    Base,
+    Document,
+    DocumentChunk,
+    DocumentPage,
+    Repo,
+    RepoChunk,
+    RepoFile,
+    RepoSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,3 +186,103 @@ def list_repo_summaries(
     if level:
         stmt = stmt.where(RepoSummary.level == level)
     return list(session.scalars(stmt).all())
+
+
+def list_repos(session: Session) -> list[Repo]:
+    """Fetch all analyzed repositories ordered by created_at desc."""
+    stmt = select(Repo).order_by(Repo.created_at.desc())
+    return list(session.scalars(stmt).all())
+
+
+# ── Step 4A Document DB Operations ──────────────────────────────────────
+
+
+def get_document(session: Session, doc_id: str) -> Optional[Document]:
+    """Fetch a document row by id."""
+    return session.get(Document, doc_id)
+
+
+def find_document_by_sha256(session: Session, sha256: str) -> Optional[Document]:
+    """Find an existing ready or processing document by its SHA-256 hash."""
+    stmt = (
+        select(Document)
+        .where(Document.sha256 == sha256, Document.status == "ready")
+        .order_by(Document.created_at.desc())
+    )
+    return session.scalars(stmt).first()
+
+
+def list_documents(session: Session) -> list[Document]:
+    """List all documents ordered by creation time descending."""
+    stmt = select(Document).order_by(Document.created_at.desc())
+    return list(session.scalars(stmt).all())
+
+
+def save_document(session: Session, document: Document) -> Document:
+    """Insert or update a document record."""
+    session.add(document)
+    session.commit()
+    session.refresh(document)
+    return document
+
+
+def save_document_pages(session: Session, pages: list[DocumentPage]) -> None:
+    """Bulk insert extracted document pages."""
+    if not pages:
+        return
+    session.add_all(pages)
+    session.commit()
+
+
+def save_document_chunks(session: Session, chunks: list[DocumentChunk]) -> None:
+    """Bulk insert extracted document chunks."""
+    if not chunks:
+        return
+    session.add_all(chunks)
+    session.commit()
+
+
+def get_document_page(
+    session: Session, doc_id: str, page_number: int
+) -> Optional[DocumentPage]:
+    """Fetch a single page's text for a document."""
+    stmt = select(DocumentPage).where(
+        DocumentPage.document_id == doc_id,
+        DocumentPage.page_number == page_number,
+    )
+    return session.scalars(stmt).first()
+
+
+def get_document_pages(session: Session, doc_id: str) -> list[DocumentPage]:
+    """Fetch all pages for a document ordered by page number."""
+    stmt = (
+        select(DocumentPage)
+        .where(DocumentPage.document_id == doc_id)
+        .order_by(DocumentPage.page_number.asc())
+    )
+    return list(session.scalars(stmt).all())
+
+
+def get_document_chunks(session: Session, doc_id: str) -> list[DocumentChunk]:
+    """Fetch all chunks for a document ordered by chunk_index."""
+    stmt = (
+        select(DocumentChunk)
+        .where(DocumentChunk.document_id == doc_id)
+        .order_by(DocumentChunk.chunk_index.asc())
+    )
+    return list(session.scalars(stmt).all())
+
+
+def delete_document(session: Session, doc_id: str) -> bool:
+    """Delete a document and its pages and chunks from SQLite."""
+    from sqlalchemy import delete
+
+    doc = session.get(Document, doc_id)
+    if not doc:
+        return False
+
+    session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == doc_id))
+    session.execute(delete(DocumentPage).where(DocumentPage.document_id == doc_id))
+    session.delete(doc)
+    session.commit()
+    return True
