@@ -1,4 +1,6 @@
-# RepoLens ('Code-Based Visual Analyzer for GitHub Repos')
+# document intelligence system ('Document analysis and Code-Based Visual Analyzer for GitHub Repos')
+
+upload the documents and then analyse it and ask any related questions for anything may be for exam preparation or for any document analysis.
 
 Paste a public GitHub repository URL. The app shallow-clones it into an isolated temporary directory, scans the working tree, stores text file contents in SQLite, parses dependencies with Tree-sitter & static readers (never executing or importing anything from the clone), builds a file-connection graph, and visualizes it with an interactive layered diagram, file tree, and code viewer.
 
